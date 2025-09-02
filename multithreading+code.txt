@@ -1,0 +1,203 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#define WORD_MAX_LEN 100
+#define MAX_WORDS 2000000        // Just being safe, ive set this to a high number. i don't expect to hit this limit.
+#define THREAD_COUNT 8          // Let's use 8 threads for processing. 2,4,6,8,
+
+typedef struct {
+    char word[WORD_MAX_LEN];     // Using structure to keep the word and its frequency together.
+    int frequency;
+} WordEntry;
+
+typedef struct {
+    char* content;              // The text portion this particular thread will handle.
+    size_t startIdx;            // Starting index for our thread's slice of the whole text.
+    size_t endIdx;              // Ending index for this slice. Ensures the thread knows where to stop.
+    WordEntry* threadEntries;   // Each thread keeps track of words it encounters in its segment.
+    int* threadEntryCount;      // How many unique words this thread has found so far.
+} ThreadJobData;
+
+pthread_mutex_t globalMutex = PTHREAD_MUTEX_INITIALIZER;  // We'll create a mutex for managing shared data access safely.
+WordEntry* sharedWordList;    // Our global list for collected words.
+int totalWordCount = 0;       // A counter to track the number of unique words found in total.
+
+void* processTextChunk(void* arg);  // Function a thread will run to process its segment.
+void mergeThreadResults(const WordEntry* threadEntries, int entryCount);  // Combines local thread results back into a global list.
+
+int main() {
+    // Start the clock to measure how long this whole operation takes.
+    struct timespec execStartTime, execEndTime;
+    clock_gettime(CLOCK_MONOTONIC, &execStartTime);  // This gives us a precise start time.
+
+    const char* filepath = "text8.txt";  // File we're going to process.
+    FILE* file = fopen(filepath, "r");  // Open it in read mode.
+    if (!file) {  // Check if we succeeded.
+        perror("Error opening file");
+        exit(EXIT_FAILURE);  // Give up if the file isn't openable.
+    }
+
+    fseek(file, 0, SEEK_END);
+    size_t fileLength = ftell(file);  // Find out the file's length.
+    fseek(file, 0, SEEK_SET);
+
+    if (fileLength <= 0) {  // Something's wrong if it's zero or negative.
+        fprintf(stderr, "File is empty or error reading file size\n");
+        fclose(file);
+        exit(EXIT_FAILURE);  // Exit since we can't do much with an empty file.
+    }
+
+    // Allocate enough space to read the entire file into memory.
+    char* fileBuffer = (char*)malloc(fileLength + 1);  // Plus one for the null-terminator.
+    if (fileBuffer == NULL) {
+        perror("Failed to allocate memory for buffer");
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+    fread(fileBuffer, 1, fileLength, file);  // Read all data.
+    fileBuffer[fileLength] = '\0';           // Terminate the string.
+    fclose(file);                            // We're done with the file itself.
+
+    // Allocate space for global word storage. It's shared among threads.
+    sharedWordList = (WordEntry*)malloc(MAX_WORDS * sizeof(WordEntry));
+    if (sharedWordList == NULL) {
+        perror("Failed to allocate memory for global entries");
+        free(fileBuffer);
+        exit(EXIT_FAILURE);
+    }
+
+    // Create threads and data they need.
+    pthread_t threads[THREAD_COUNT];
+    ThreadJobData threadJobData[THREAD_COUNT];
+    size_t chunkSize = fileLength / THREAD_COUNT;  // Divide file up based on number of threads.
+
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        threadJobData[i].content = fileBuffer;  // Hand over the full buffer to each thread.
+        threadJobData[i].startIdx = i * chunkSize;  // Calculate where the thread’s segment starts.
+
+        // Calculate the end of the segment for each thread.
+        if (i == THREAD_COUNT - 1) {
+            threadJobData[i].endIdx = fileLength;  // Last thread takes till the very end.
+        } else {
+            threadJobData[i].endIdx = (i + 1) * chunkSize;  // Otherwise, segment end before another thread starts.
+            while (threadJobData[i].endIdx < fileLength && !isspace(fileBuffer[threadJobData[i].endIdx])) {
+                threadJobData[i].endIdx++;  // Adjust to ensure we don't split words in half.
+            }
+        }
+
+        // Allocate personal word storage for each thread.
+        threadJobData[i].threadEntries = (WordEntry*)calloc(MAX_WORDS / THREAD_COUNT, sizeof(WordEntry));
+        threadJobData[i].threadEntryCount = calloc(1, sizeof(int));
+
+        // Now, let's create the thread to process the segment.
+        if (pthread_create(&threads[i], NULL, processTextChunk, &threadJobData[i]) != 0) {
+            perror("Failed to create thread");
+            free(fileBuffer);
+            free(sharedWordList);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        pthread_join(threads[i], NULL);  // Wait for threads to finish.
+        mergeThreadResults(threadJobData[i].threadEntries, *threadJobData[i].threadEntryCount);  // Bring thread results into the global list.
+        free(threadJobData[i].threadEntries);  // Clean up the per-thread data.
+        free(threadJobData[i].threadEntryCount);
+    }
+
+    // Sort the words globally by their frequency.
+    for (int i = 0; i < totalWordCount - 1; i++) {
+        for (int j = i + 1; j < totalWordCount; j++) {
+            if (sharedWordList[i].frequency < sharedWordList[j].frequency) {
+                WordEntry temp = sharedWordList[i];
+                sharedWordList[i] = sharedWordList[j];
+                sharedWordList[j] = temp;
+            }
+        }
+    }
+
+    // Let's print the top 10 words by frequency.
+    printf("Top 10 frequently occurring words:\n");
+    for (int i = 0; i < 10 && i < totalWordCount; i++) {
+        printf("%d. %s - %d times\n", i + 1, sharedWordList[i].word, sharedWordList[i].frequency);
+    }
+
+    // Free up the allocated resources.
+    free(fileBuffer);
+    free(sharedWordList);
+    pthread_mutex_destroy(&globalMutex);
+
+    // End the timer and print out how long the whole operation took.
+    clock_gettime(CLOCK_MONOTONIC, &execEndTime);
+    double timeElapsed = (execEndTime.tv_sec - execStartTime.tv_sec) +
+                         (execEndTime.tv_nsec - execStartTime.tv_nsec) / 1e9;
+    printf("Execution time: %.3f seconds\n", timeElapsed);
+
+    return 0;
+}
+
+void* processTextChunk(void* arg) {
+    ThreadJobData* job = (ThreadJobData*)arg;  // Get the passed job data for this thread.
+
+    // Duplicate the section of the text for this thread to work with.
+    char* textSegment = strndup(job->content + job->startIdx, job->endIdx - job->startIdx);
+    if (textSegment == NULL) {
+        perror("Failed to duplicate string for threading");
+        pthread_exit(NULL);
+    }
+
+    // Safe tokenization across threads.
+    char* saveptr;
+    char* token = strtok_r(textSegment, " \t\n\r", &saveptr);  // Split the segment into words.
+    while (token != NULL) {
+        for (char* p = token; *p; ++p) *p = tolower(*p);  // Convert everything to lowercase to avoid case sensitivity issues.
+
+        int found = 0;
+        for (int i = 0; i < *job->threadEntryCount; i++) {
+            if (strcmp(job->threadEntries[i].word, token) == 0) {  // Check if this word already exists in local data.
+                job->threadEntries[i].frequency++;  // Increment count if found.
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found && *job->threadEntryCount < MAX_WORDS / THREAD_COUNT) {  // If it's a new word and we have space.
+            strncpy(job->threadEntries[*job->threadEntryCount].word, token, WORD_MAX_LEN - 1);  // Add it to our list.
+            job->threadEntries[*job->threadEntryCount].word[WORD_MAX_LEN - 1] = '\0';
+            job->threadEntries[*job->threadEntryCount].frequency = 1;  // Start the count at one for a new word.
+            (*job->threadEntryCount)++;
+        }
+
+        token = strtok_r(NULL, " \t\n\r", &saveptr);  // Move to the next word.
+    }
+
+    free(textSegment);  // Free up our duplicate segment since we are done processing it.
+    pthread_exit(NULL);  // This thread has completed its task.
+}
+
+void mergeThreadResults(const WordEntry* threadEntries, int entryCount) {
+    pthread_mutex_lock(&globalMutex);  // Lock the mutex to ensure only one thread can update the global list at a time.
+
+    for (int i = 0; i < entryCount; i++) {
+        int found = 0;
+        for (int j = 0; j < totalWordCount; j++) {
+            if (strcmp(sharedWordList[j].word, threadEntries[i].word) == 0) {  // Check if this word is already in the global list.
+                sharedWordList[j].frequency += threadEntries[i].frequency;  // If found, just update the frequency.
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found && totalWordCount < MAX_WORDS) {  // If the word isn't found and there is space, add it.
+            strcpy(sharedWordList[totalWordCount].word, threadEntries[i].word);
+            sharedWordList[totalWordCount].frequency = threadEntries[i].frequency;
+            totalWordCount++;
+        }
+    }
+
+    pthread_mutex_unlock(&globalMutex);  // Unlock the mutex so the next thread can access the global list.
+}

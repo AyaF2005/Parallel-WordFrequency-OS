@@ -1,0 +1,172 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+
+// Constants defining word constraints and process count
+#define WORD_MAX_LEN 100       // Define the maximum length for a single word
+#define MAX_UNIQ_WORDS 253854  // Estimated upper limit for unique words we anticipate
+#define NUM_WORKERS 8          // Set total child processes for parallel work; Ill adjust 2,4,6,8,
+
+// Structure to hold each unique word and its frequency count
+typedef struct {
+    char word[WORD_MAX_LEN];  // Array to store the word itself
+    int frequency;            // Integer to count occurrences of this word
+} WordEntry;
+
+// Function prototype to process each text segment
+void processTextSegment(const char* text, size_t start, size_t end, WordEntry* segmentWords, int* wordCount);
+
+int main() {
+    const char* filename = "text8.txt";      // Path to the text file we want to process
+    FILE* file = fopen(filename, "r");      // Open the file in read mode
+    if (!file) {  // Handle the case when the file cannot be opened
+        perror("Error opening file");
+        exit(EXIT_FAILURE); // Exit with failure status
+    }
+
+    // Read the file content into a large buffer for manipulation
+    fseek(file, 0, SEEK_END);               // Move file pointer to the end
+    size_t fileSize = ftell(file);          // Get current file pointer position (size)
+    fseek(file, 0, SEEK_SET);               // Move file pointer back to the beginning
+    char* buffer = (char*)malloc(fileSize + 1); // Allocate memory for the file content plus null terminator
+    if (!buffer) {  // Exit if memory allocation fails
+        perror("Failed to allocate memory");
+        fclose(file);             // Close file before exiting
+        exit(EXIT_FAILURE);
+    }
+    fread(buffer, 1, fileSize, file);       // Read file content into buffer
+    buffer[fileSize] = '\0';                // Null-terminate the buffer
+    fclose(file);                           // Close the file after reading
+
+    // Setup shared memory for frequency counts and word data across processes
+    int* processWordCounts = mmap(NULL, NUM_WORKERS * sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    WordEntry* sharedWordData = mmap(NULL, NUM_WORKERS * MAX_UNIQ_WORDS * sizeof(WordEntry), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sharedWordData == MAP_FAILED || processWordCounts == MAP_FAILED) {
+        perror("Memory mapping failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Initialize shared memory structures
+    for (int i = 0; i < NUM_WORKERS * MAX_UNIQ_WORDS; i++) {
+        memset(sharedWordData[i].word, 0, WORD_MAX_LEN); // Set all word strings to empty
+        sharedWordData[i].frequency = 0;                 // Initialize frequencies to zero
+    }
+
+    // Partition the file into segments for each processing unit
+    size_t sectionSize = fileSize / NUM_WORKERS; // Calculate size of each file segment
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pid_t pid = fork();  // Fork a new process
+        if (pid == -1) {     // Handle failure to create a child process
+            perror("Fork failed");
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) {  // This path runs for child process
+            size_t start = i * sectionSize;  // Determine the start index of the segment
+            size_t end = (i == NUM_WORKERS - 1) ? fileSize : (i + 1) * sectionSize;  // Final process might run past fileSize
+
+            // Adjust to avoid cutting words between boundaries
+            if (start != 0) {
+                while (start < fileSize && !isspace(buffer[start])) start++;
+            }
+            if (end < fileSize) {
+                while (end < fileSize && !isspace(buffer[end])) end++;
+            }
+
+            // Process this segment and update shared memory with results
+            processTextSegment(buffer, start, end, &sharedWordData[i * MAX_UNIQ_WORDS], &processWordCounts[i]);
+            exit(0);  // Child process exit after processing
+        }
+    }
+
+    // Parent process waits for all child processes to complete
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        wait(NULL);  // Waiting for each child process termination
+    }
+
+    // Consolidate results from all children to form final result set
+    WordEntry* consolidatedResults = (WordEntry*)calloc(MAX_UNIQ_WORDS, sizeof(WordEntry));
+    int totalUniqueWords = 0;  // Count of total unique words collected
+
+    for (int proc = 0; proc < NUM_WORKERS; proc++) {
+        for (int w = 0; w < processWordCounts[proc]; w++) {
+            int found = 0; // Flag to check if the word already exists in the final list
+            for (int j = 0; j < totalUniqueWords; j++) {
+                if (strcmp(consolidatedResults[j].word, sharedWordData[proc * MAX_UNIQ_WORDS + w].word) == 0) {
+                    consolidatedResults[j].frequency += sharedWordData[proc * MAX_UNIQ_WORDS + w].frequency;  // Add frequency
+                    found = 1; // Mark as found
+                    break;
+                }
+            }
+            if (!found && totalUniqueWords < MAX_UNIQ_WORDS) {
+                strcpy(consolidatedResults[totalUniqueWords].word, sharedWordData[proc * MAX_UNIQ_WORDS + w].word);
+                consolidatedResults[totalUniqueWords].frequency = sharedWordData[proc * MAX_UNIQ_WORDS + w].frequency;
+                totalUniqueWords++; // Increase the count for unique
+            }
+        }
+    }
+
+    // Sort the gathered words by their frequencies (descending order)
+    for (int i = 0; i < totalUniqueWords - 1; ++i) {
+        for (int j = i + 1; j < totalUniqueWords; ++j) {
+            if (consolidatedResults[i].frequency < consolidatedResults[j].frequency) {
+                WordEntry temp = consolidatedResults[i];
+                consolidatedResults[i] = consolidatedResults[j];
+                consolidatedResults[j] = temp;
+            }
+        }
+    }
+
+    // Output the top 10 most frequently occurring words
+    printf("Top 10 frequently occurring words:\n");
+    for (int i = 0; i < 10 && i < totalUniqueWords; i++) {
+        printf("%d. %s - %d times\n", i + 1, consolidatedResults[i].word, consolidatedResults[i].frequency);
+    }
+
+    // Cleanup shared memory and allocated resources
+    munmap(sharedWordData, NUM_WORKERS * MAX_UNIQ_WORDS * sizeof(WordEntry));
+    munmap(processWordCounts, NUM_WORKERS * sizeof(int));
+    free(consolidatedResults);
+    free(buffer);
+
+    return 0;  // Exit successfully
+}
+
+// Define how each segment is processed by a child process
+void processTextSegment(const char* text, size_t start, size_t end, WordEntry* data, int* count) {
+    // Duplicate and tokenize the segment for targeted text processing
+    char* segment = strndup(text + start, end - start); // Duplicate the text section
+    if (!segment) {  // Check for duplication failure
+        perror("Failed to duplicate text segment"); 
+        exit(EXIT_FAILURE);
+    }
+
+    char* token = strtok(segment, " \t\n\r");  // Tokenize the text by spaces and newlines
+    while (token) {
+        // Convert each token to lowercase for case-insensitive handling
+        for (char* p = token; *p; ++p) *p = tolower(*p);
+
+        int found = 0; // Flag for word detection
+        for (int i = 0; i < *count; i++) {
+            if (strcmp(data[i].word, token) == 0) {
+                data[i].frequency++; // Increment frequency if found
+                found = 1; 
+                break;
+            }
+        }
+
+        // If the word is new, add it to segment results
+        if (!found && *count < MAX_UNIQ_WORDS) {
+            strncpy(data[*count].word, token, WORD_MAX_LEN - 1); 
+            data[*count].word[WORD_MAX_LEN - 1] = '\0'; // Ensure null-termination
+            data[*count].frequency = 1; // Initialize frequency for a new word
+            (*count)++;
+        }
+
+        token = strtok(NULL, " \t\n\r");  // Move to the next token
+    }
+
+    free(segment); // Free the duplicated segment after processing is done
+}

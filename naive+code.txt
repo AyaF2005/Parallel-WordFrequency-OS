@@ -1,0 +1,105 @@
+#include <stdio.h>    // Standard I/O library for file operations and console output
+#include <stdlib.h>   // Standard library for memory allocation and process control
+#include <string.h>   // String manipulation functions
+#include <ctype.h>    // Character type functions like tolower
+#include <time.h>     // Time functions for measuring execution time
+
+#define WORD_MAX_LEN 100           // Maximum length for a single word
+#define MAX_WORDS 253854           // Maximum number of unique words expected
+
+// Define a structure to store words and their frequency
+typedef struct {
+    char word[WORD_MAX_LEN];      // A string to hold the word
+    int frequency;                // An integer count of how often the word appears
+} WordEntry;
+
+int main() {
+    struct timespec start, end;  // Structures to store start and end times
+
+    // Start timing the entire execution
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    // Define the file name to be processed
+    const char* filename = "text8.txt";
+    FILE* file = fopen(filename, "r");  // Open the file in read mode
+    if (!file) {  // Check if the file was opened successfully
+        perror("Error opening file");
+        exit(EXIT_FAILURE);  // Exit if the file could not be opened
+    }
+
+    // Measure time to read the file into a buffer
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    fseek(file, 0, SEEK_END);              // Move file pointer to the end to determine file size
+    size_t file_size = ftell(file);        // Get the current position in the file, i.e., its size
+    fseek(file, 0, SEEK_SET);              // Reset file pointer back to the start
+    char* buffer = (char*)malloc(file_size + 1); // Allocate memory to store the file content
+    fread(buffer, 1, file_size, file);     // Read the entire file into the buffer
+    buffer[file_size] = '\0';              // Ensure the buffer is null-terminated
+    fclose(file);                          // Close the file after reading
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double file_read_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("File reading time: %.6f seconds\n", file_read_time); // Output the file reading time
+
+    // Allocate memory for storing words and their frequencies
+    WordEntry* wordEntries = (WordEntry*)calloc(MAX_WORDS, sizeof(WordEntry));
+    int uniqueWordsCount = 0; // Counter for the number of unique words
+
+    // Measure time for tokenization and frequency counting
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    char* token = strtok(buffer, " \t\n\r"); // Split the buffer into tokens based on whitespace
+    while (token) {  // Iterate through each token
+        for (char* p = token; *p; ++p) *p = tolower(*p); // Convert each character to lowercase
+
+        int found = 0;  // Flag to check if the word was found in the existing list
+        for (int i = 0; i < uniqueWordsCount; i++) {
+            if (strcmp(wordEntries[i].word, token) == 0) { // Compare token with existing words
+                wordEntries[i].frequency++;  // Increment frequency if a match is found
+                found = 1;                   // Mark as found
+                break;                       // Exit the loop once the word is found
+            }
+        }
+
+        if (!found && uniqueWordsCount < MAX_WORDS) { // If the word is new and within limit
+            strncpy(wordEntries[uniqueWordsCount].word, token, WORD_MAX_LEN - 1); // Copy the new word
+            wordEntries[uniqueWordsCount].frequency = 1; // Start count at 1
+            uniqueWordsCount++;                         // Increment the unique words counter
+        }
+
+        token = strtok(NULL, " \t\n\r");  // Get the next token
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double tokenization_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Tokenization and counting time: %.6f seconds\n", tokenization_time); // Output tokenization time
+
+    // Measure time for sorting (Descending order by frequency)
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < uniqueWordsCount - 1; i++) {
+        for (int j = i + 1; j < uniqueWordsCount; j++) {
+            if (wordEntries[i].frequency < wordEntries[j].frequency) {  // Compare frequencies
+                WordEntry temp = wordEntries[i];  // Swap if necessary
+                wordEntries[i] = wordEntries[j];
+                wordEntries[j] = temp;
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double sorting_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Sorting time: %.6f seconds\n", sorting_time);  // Output the sorting time
+
+    // Print the top 10 frequent words
+    printf("Top 10 frequently occurring words:\n");
+    for (int i = 0; i < 10 && i < uniqueWordsCount; i++) {
+        printf("%d. %s - %d times\n", i + 1, wordEntries[i].word, wordEntries[i].frequency); // Output word and frequency
+    }
+
+    // Measure total execution time (should actually measure whole process if this is needed)
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double total_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Total execution time: %.6f seconds\n", total_time);  // Output total execution time
+
+    // Clean up allocated memory
+    free(wordEntries);  // Free memory for word frequency storage
+    free(buffer);       // Free memory for file content storage
+
+    return 0;  // Return success status
+}
